@@ -1,0 +1,116 @@
+import os
+import json
+from contextlib import asynccontextmanager
+
+from starlette.applications import Starlette
+from starlette.responses import JSONResponse
+from starlette.routing import Route, Mount
+
+from mcp.server.transport_security import TransportSecuritySettings
+
+from .server import PixverseMCPServer
+
+
+# Création du serveur PixVerse existant
+pixverse = PixverseMCPServer()
+
+
+# Autoriser le domaine Render
+render_host = os.getenv("RENDER_EXTERNAL_HOSTNAME")
+
+if render_host:
+    security = TransportSecuritySettings(
+        enable_dns_rebinding_protection=True,
+        allowed_hosts=[f"{render_host}:*"],
+        allowed_origins=[f"https://{render_host}"],
+    )
+else:
+    security = TransportSecuritySettings(
+        enable_dns_rebinding_protection=True,
+        allowed_hosts=[
+            "localhost:*",
+            "127.0.0.1:*",
+        ],
+        allowed_origins=[
+            "http://localhost:*",
+            "http://127.0.0.1:*",
+        ],
+    )
+
+
+# Création de l'application MCP
+mcp_app = pixverse.server.streamable_http_app(
+    streamable_http_path="/mcp",
+    transport_security=security,
+)
+
+
+# Initialisation du serveur
+@asynccontextmanager
+async def lifespan(app):
+    await pixverse.initialize()
+
+    async with pixverse.server.session_manager.run():
+        yield
+
+
+# Vérification de disponibilité
+async def health(request):
+    return JSONResponse({
+        "status": "online",
+        "service": "PixVerse MCP",
+    })
+
+
+# Application principale
+app = Starlette(
+    routes=[
+        Route("/health", health),
+        Mount("/", app=mcp_app),
+    ],
+    lifespan=lifespan,
+)
+
+
+# Protection par jeton privé
+class BearerAuth:
+    def __init__(self, application):
+        self.application = application
+
+    async def __call__(self, scope, receive, send):
+        if scope["type"] == "http" and scope["path"].startswith("/mcp"):
+            expected = os.getenv("MCP_ACCESS_TOKEN")
+
+            headers = dict(scope.get("headers", []))
+            authorization = headers.get(
+                b"authorization", b""
+            ).decode("utf-8")
+
+            if not expected or authorization != f"Bearer {expected}":
+                body = json.dumps({
+                    "error": "Unauthorized"
+                }).encode("utf-8")
+
+                await send({
+                    "type": "http.response.start",
+                    "status": 401,
+                    "headers": [
+                        (b"content-type", b"application/json"),
+                        (b"content-length", str(len(body)).encode()),
+                    ],
+                })
+
+                await send({
+                    "type": "http.response.body",
+                    "body": body,
+                })
+                return
+
+        await self.application(scope, receive, send)
+
+
+app = BearerAuth(app)
+"mcp[cli]>=1.6.0",
+"mcp[cli]>=1.6.0,<2.0.0",
+pip install .
+uvicorn pixverse_mcp.remote_app:app --host 0.0.0.0 --port $PORT
